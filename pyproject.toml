@@ -1,0 +1,37 @@
+[project]
+name = "litegpt"
+version = "0.1.0"
+description = "Minimal GPT-2 class chat model — nanochat-style, one codebase for local smoke tests and 3×H200 training"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.4.0",
+    "tiktoken>=0.7.0",
+    "numpy>=1.26.0",
+]
+
+[project.optional-dependencies]
+# Install for real dataset loading (remote training)
+data = [
+    "datasets>=2.20.0",
+]
+# Install for web UI
+web = [
+    "fastapi>=0.111.0",
+    "uvicorn>=0.30.0",
+]
+# Everything for remote training
+full = [
+    "litegpt[data,web]",
+]
+
+[project.scripts]
+litegpt-train = "litegpt.train:main"
+litegpt-chat  = "litegpt.chat:main"
+
+[build-system]
+requires      = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["litegpt"]
