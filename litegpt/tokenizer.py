@@ -55,7 +55,9 @@ class Tokenizer:
     # ------------------------------------------------------------------
 
     def encode(self, text: str) -> list[int]:
-        return self.enc.encode(text)
+        # disallowed_special=() treats any special-token strings (e.g. <|endoftext|>)
+        # found in the raw text as normal text rather than raising an error.
+        return self.enc.encode(text, disallowed_special=())
 
     def decode(self, ids: list[int]) -> str:
         # Strip special tokens before decoding
