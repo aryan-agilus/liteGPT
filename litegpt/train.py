@@ -109,6 +109,12 @@ def main():
                         help="Muon learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--grad_clip",  type=float, default=1.0)
+    parser.add_argument("--grad_accum", type=int,   default=1,
+                        help="Gradient accumulation steps. "
+                             "Effective batch = batch_size × grad_accum × world_size.")
+    parser.add_argument("--grad_ckpt",  action="store_true",
+                        help="Enable gradient checkpointing (~8x less activation memory, "
+                             "~33% more compute). Recommended for depth>=12 on single GPU.")
 
     # Device / precision
     parser.add_argument("--device",     type=str,   default=None,
@@ -154,10 +160,13 @@ def main():
     else:
         autocast_ctx = contextlib.nullcontext()
 
+    eff_batch = args.batch_size * args.grad_accum * world_size
+
     if is_master:
         print(f"\n{'='*60}")
         print(f"  device={device}  dtype={dtype}  world_size={world_size}")
         print(f"  depth={args.depth}  seq_len={args.seq_len}  batch={args.batch_size}")
+        print(f"  grad_accum={args.grad_accum}  eff_batch={eff_batch}  grad_ckpt={args.grad_ckpt}")
         print(f"  max_steps={args.max_steps}  dataset={args.dataset}")
         print(f"{'='*60}\n")
 
@@ -166,6 +175,7 @@ def main():
     # ------------------------------------------------------------------
     config = GPTConfig(depth=args.depth, seq_len=args.seq_len)
     model  = GPT(config).to(device).to(dtype)
+    model.gradient_checkpointing = args.grad_ckpt
     model.setup_rope()
 
     if is_master:
@@ -176,9 +186,10 @@ def main():
     resume_ckpt: dict | None = None
 
     if args.resume:
-        resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(resume_ckpt["model"])
-        start_step = resume_ckpt.get("step", 0)
+        _ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(_ckpt["model"])
+        start_step  = _ckpt.get("step", 0)
+        resume_ckpt = _ckpt
         if is_master:
             print(f"Resumed from {args.resume} at step {start_step}")
 
@@ -235,27 +246,42 @@ def main():
         adamw_lr = muon_lr * (config.model_dim / 768) ** -0.5
         set_lr(optimizer, muon_lr, adamw_lr)
 
-        # Fetch batch (restart iterator on exhaustion)
-        try:
-            x, y = next(data_iter)
-        except StopIteration:
-            data_iter = iter(loader)
-            x, y = next(data_iter)
-
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        # Forward + backward
-        with autocast_ctx:
-            _, loss = model(x, y)
-
+        # ── Gradient accumulation loop ────────────────────────────────
+        # Accumulate gradients over grad_accum micro-steps before one
+        # optimizer update. For DDP, suppress the all-reduce on every
+        # micro-step except the last (no_sync saves ~2x communication).
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        loss_accum = 0.0
+
+        for micro in range(args.grad_accum):
+            try:
+                x, y = next(data_iter)
+            except StopIteration:
+                data_iter = iter(loader)
+                x, y = next(data_iter)
+
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            # Only sync gradients across ranks on the final micro-step
+            is_last_micro = micro == args.grad_accum - 1
+            sync_ctx = (
+                contextlib.nullcontext()
+                if (not is_ddp or is_last_micro)
+                else model.no_sync()
+            )
+
+            with sync_ctx, autocast_ctx:
+                _, loss = model(x, y)
+                loss = loss / args.grad_accum   # scale so grad magnitude stays constant
+
+            loss.backward()
+            loss_accum += loss.item()
 
         nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
 
-        tokens_since_log += args.batch_size * args.seq_len * world_size
+        tokens_since_log += args.batch_size * args.grad_accum * args.seq_len * world_size
 
         # Logging
         if is_master and step % args.log_every == 0:
@@ -263,7 +289,7 @@ def main():
             tok_per_s = tokens_since_log / elapsed
             print(
                 f"step {step:6d}/{args.max_steps} | "
-                f"loss {loss.item():.4f} | "
+                f"loss {loss_accum:.4f} | "
                 f"lr {muon_lr:.2e} | "
                 f"{tok_per_s:,.0f} tok/s"
             )

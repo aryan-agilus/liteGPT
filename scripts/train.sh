@@ -25,36 +25,42 @@ cd "$REPO_ROOT"
 # Defaults
 DEPTH="${DEPTH:-24}"
 SEQ_LEN="${SEQ_LEN:-2048}"
-BATCH_SIZE="${BATCH_SIZE:-32}"
-MAX_STEPS="${MAX_STEPS:-50000}"
 NPROC="${NPROC:-3}"
 DATASET="${DATASET:-text}"
-DATA_PATH="${DATA_PATH:-data/train.bin}"
+DATA_PATH="${DATA_PATH:-data/pretrain.bin}"
+MAX_STEPS="${MAX_STEPS:-50000}"
 RESUME="${RESUME:-}"
+
+# Memory config — tuned for 3×H200 (140 GB each) with depth=24
+# batch=8 + grad_accum=4 → eff_batch = 8*4*3 = 96 seqs × 2048 tok = ~196K tok/step
+# With --grad_ckpt: activation memory ~8x lower, safely fits with batch=16
+BATCH_SIZE="${BATCH_SIZE:-8}"
+GRAD_ACCUM="${GRAD_ACCUM:-4}"
+GRAD_CKPT="${GRAD_CKPT:-true}"   # set to "" to disable
+
+eff_batch=$((BATCH_SIZE * GRAD_ACCUM * NPROC))
 
 echo "============================================================"
 echo "  liteGPT distributed training"
-echo "  GPUs:       $NPROC × H200"
-echo "  depth:      $DEPTH"
-echo "  seq_len:    $SEQ_LEN"
-echo "  batch/gpu:  $BATCH_SIZE  (total: $((BATCH_SIZE * NPROC)))"
-echo "  max_steps:  $MAX_STEPS"
-echo "  dataset:    $DATASET"
+echo "  GPUs:        $NPROC × H200"
+echo "  depth:       $DEPTH"
+echo "  seq_len:     $SEQ_LEN"
+echo "  batch/gpu:   $BATCH_SIZE  grad_accum=$GRAD_ACCUM"
+echo "  eff_batch:   $eff_batch sequences / step"
+echo "  max_steps:   $MAX_STEPS"
+echo "  dataset:     $DATASET"
+echo "  grad_ckpt:   $GRAD_CKPT"
 if [[ -n "$RESUME" ]]; then
-echo "  resume:     $RESUME"
+echo "  resume:      $RESUME"
 fi
 echo "============================================================"
 
 EXTRA_ARGS=""
-if [[ -n "$RESUME" ]]; then
-    EXTRA_ARGS="--resume $RESUME"
-fi
+[[ -n "$RESUME"    ]] && EXTRA_ARGS="$EXTRA_ARGS --resume $RESUME"
+[[ -n "$GRAD_CKPT" ]] && EXTRA_ARGS="$EXTRA_ARGS --grad_ckpt"
 
-if [[ "$DATASET" == "text" ]]; then
-    DATA_ARG="--data_path $DATA_PATH"
-else
-    DATA_ARG=""
-fi
+DATA_ARG=""
+[[ "$DATASET" == "text" ]] && DATA_ARG="--data_path $DATA_PATH"
 
 torchrun \
     --nproc_per_node="$NPROC" \
@@ -63,10 +69,11 @@ torchrun \
         --depth       "$DEPTH"      \
         --seq_len     "$SEQ_LEN"    \
         --batch_size  "$BATCH_SIZE" \
+        --grad_accum  "$GRAD_ACCUM" \
         --max_steps   "$MAX_STEPS"  \
         --dataset     "$DATASET"    \
         $DATA_ARG                   \
-        --log_every   100           \
+        --log_every   50            \
         --save_every  5000          \
         --checkpoint_dir checkpoints \
         $EXTRA_ARGS

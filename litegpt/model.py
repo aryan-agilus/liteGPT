@@ -18,6 +18,7 @@ Modern choices from nanochat:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from dataclasses import dataclass
 
 
@@ -188,6 +189,9 @@ class GPT(nn.Module):
         self.register_buffer("rope_cos", torch.zeros(config.seq_len, config.head_dim))
         self.register_buffer("rope_sin", torch.zeros(config.seq_len, config.head_dim))
 
+        # Set True to trade ~33% extra compute for ~8x less activation memory
+        self.gradient_checkpointing = False
+
         self._init_weights()
 
     def _init_weights(self):
@@ -218,7 +222,12 @@ class GPT(nn.Module):
         sin = self.rope_sin[:T]
 
         for block in self.blocks:
-            x = block(x, cos, sin)
+            if self.gradient_checkpointing and self.training:
+                # Recompute activations during backward — ~8x less activation memory,
+                # ~33% more compute. Essential for large models on limited VRAM.
+                x = grad_checkpoint(block, x, cos, sin, use_reentrant=False)
+            else:
+                x = block(x, cos, sin)
 
         x = self.norm(x)
         logits = self.head(x)
