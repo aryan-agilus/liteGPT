@@ -181,8 +181,14 @@ def prepare_sft(args):
         slug  = args.dataset
         field = "messages"
 
+    # SmolTalk requires an explicit config name; use 'all' to get every subset
+    config = "all" if slug == SMOLTALK_SLUG else None
+
     print(f"Downloading {slug} …")
-    ds = load_dataset(slug, split="train", streaming=True)
+    if config:
+        ds = load_dataset(slug, config, split="train", streaming=True)
+    else:
+        ds = load_dataset(slug, split="train", streaming=True)
 
     all_tokens: list[int] = []
     all_masks:  list[int] = []
