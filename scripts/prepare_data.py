@@ -97,6 +97,8 @@ def prepare_pretrain(args):
             if text:
                 all_tokens.append(tok.bos_id)
                 all_tokens.extend(tok.encode(text))
+            if (i + 1) % 10_000 == 0:
+                print(f"  {i+1:,} docs | {len(all_tokens):,} tokens")
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     write_uint16_bin(args.out, all_tokens)
