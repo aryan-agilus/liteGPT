@@ -41,7 +41,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from litegpt.model import GPT, GPTConfig
 from litegpt.optimizer import MuonAdamW, partition_params
 from litegpt.sft_dataset import get_sft_dataloader
-from litegpt.train import get_device, cosine_lr, setup_distributed, set_lr
+from litegpt.train import get_device, cosine_lr, setup_distributed, set_lr, find_latest_checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +121,10 @@ def main():
 
     args = parser.parse_args()
 
+    # Auto-resume: if no --resume given, look for the latest SFT checkpoint
+    if args.resume is None:
+        args.resume = find_latest_checkpoint(args.checkpoint_dir, glob_pattern="sft_*.pt")
+
     # ------------------------------------------------------------------
     # Distributed
     # ------------------------------------------------------------------
@@ -182,7 +186,6 @@ def main():
         model.gradient_checkpointing = args.grad_ckpt
         model.setup_rope()
 
-    resume_ckpt: dict | None = None
     if args.resume:
         _r = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(_r["model"])
@@ -204,6 +207,10 @@ def main():
         model = DDP(model, device_ids=[local_rank])
 
     raw_model = model.module if is_ddp else model
+    # torch.compile wraps the model under ._orig_mod — unwrap so state_dict
+    # keys are plain (e.g. "embed.weight") not "_orig_mod.embed.weight"
+    if hasattr(raw_model, "_orig_mod"):
+        raw_model = raw_model._orig_mod
 
     # ------------------------------------------------------------------
     # Optimizer — lower LR than pretrain (weights are already meaningful)

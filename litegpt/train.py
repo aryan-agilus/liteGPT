@@ -75,6 +75,14 @@ def setup_distributed() -> tuple[int, int, bool]:
     return local_rank, world_size, True
 
 
+def find_latest_checkpoint(checkpoint_dir: str, glob_pattern: str = "ckpt_*.pt") -> str | None:
+    """Return the path to the most recent step checkpoint in checkpoint_dir, or None."""
+    import glob as _glob
+    pattern = os.path.join(checkpoint_dir, glob_pattern)
+    candidates = sorted(_glob.glob(pattern))  # lexicographic = step order
+    return candidates[-1] if candidates else None
+
+
 def set_lr(optimizer: MuonAdamW, muon_lr: float, adamw_lr: float):
     for group in optimizer.param_groups:
         if group.get("use_muon", False):
@@ -133,6 +141,10 @@ def main():
     parser.add_argument("--log_every",  type=int,   default=10)
 
     args = parser.parse_args()
+
+    # Auto-resume: if no --resume given, look for the latest checkpoint
+    if args.resume is None:
+        args.resume = find_latest_checkpoint(args.checkpoint_dir)
 
     # ------------------------------------------------------------------
     # Distributed init
@@ -207,8 +219,10 @@ def main():
         model = DDP(model, device_ids=[local_rank])
 
     raw_model = model.module if is_ddp else model
-    if args.compile and not is_ddp:
-        raw_model = model  # compiled but not DDP-wrapped
+    # torch.compile wraps the model under ._orig_mod — unwrap so state_dict
+    # keys are plain (e.g. "embed.weight") not "_orig_mod.embed.weight"
+    if hasattr(raw_model, "_orig_mod"):
+        raw_model = raw_model._orig_mod
 
     # ------------------------------------------------------------------
     # Optimizer
