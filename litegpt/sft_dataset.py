@@ -102,25 +102,29 @@ class SFTBinDataset(Dataset):
         self.seq_len = seq_len
         self.stride  = seq_len + 1
 
-        tokens_raw = np.fromfile(tokens_path, dtype=np.uint16)
-        mask_raw   = np.fromfile(mask_path,   dtype=np.uint8)
+        # memmap: OS pages in only what's accessed — all 3 DDP processes share
+        # the same physical pages via the page cache instead of each loading a
+        # full copy into RAM.  Typical saving: ~9 GB → ~0 GB RSS per process.
+        self.tokens = np.memmap(tokens_path, dtype=np.uint16, mode="r")
+        self.mask   = np.memmap(mask_path,   dtype=np.uint8,  mode="r")
 
-        assert len(tokens_raw) == len(mask_raw), (
-            f"Token/mask length mismatch: {len(tokens_raw)} vs {len(mask_raw)}"
+        assert len(self.tokens) == len(self.mask), (
+            f"Token/mask length mismatch: {len(self.tokens)} vs {len(self.mask)}"
         )
 
-        self.tokens = torch.from_numpy(tokens_raw.astype(np.int64))
-        self.mask   = torch.from_numpy(mask_raw.astype(np.float32))
-        self.n      = len(self.tokens) // self.stride
+        self.n = len(self.tokens) // self.stride
 
     def __len__(self) -> int:
         return self.n
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        start = idx * self.stride
-        chunk = self.tokens[start : start + self.stride]
-        mchunk = self.mask[start : start + self.stride]
-        return chunk[:-1], chunk[1:], mchunk[1:]   # x, y, mask
+        start  = idx * self.stride
+        # Copy the slice out of the mmap — keeps the window small in RAM
+        tokens = self.tokens[start : start + self.stride].astype(np.int64)
+        mask   = self.mask  [start : start + self.stride].astype(np.float32)
+        t = torch.from_numpy(tokens)
+        m = torch.from_numpy(mask)
+        return t[:-1], t[1:], m[1:]   # x, y, mask
 
 
 class SFTHFDataset(Dataset):

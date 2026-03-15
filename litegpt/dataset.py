@@ -58,19 +58,19 @@ class TokenBinDataset(Dataset):
     """
 
     def __init__(self, path: str, seq_len: int = 2048):
-        data = np.fromfile(path, dtype=np.uint16)
-        # Store as int32 to avoid issues with PyTorch embedding layers
-        self.data = torch.from_numpy(data.astype(np.int32))
+        # memmap: shared page cache across DDP processes — no per-process RAM copy
+        self.data    = np.memmap(path, dtype=np.uint16, mode="r")
         self.seq_len = seq_len
-        # Each sample needs seq_len + 1 tokens (x and y share no boundary)
-        self.n = (len(self.data) - 1) // seq_len
+        self.n       = (len(self.data) - 1) // seq_len
 
     def __len__(self) -> int:
         return self.n
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         start = idx * self.seq_len
-        chunk = self.data[start : start + self.seq_len + 1].long()
+        chunk = torch.from_numpy(
+            self.data[start : start + self.seq_len + 1].astype(np.int64)
+        )
         return chunk[:-1], chunk[1:]
 
 
