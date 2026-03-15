@@ -111,6 +111,8 @@ def main():
                         help="Gradient accumulation steps.")
     parser.add_argument("--grad_ckpt",    action="store_true",
                         help="Enable gradient checkpointing.")
+    parser.add_argument("--compile",      action="store_true",
+                        help="torch.compile for ~20-30%% extra throughput.")
     parser.add_argument("--log_every",    type=int,   default=10)
 
     # Device
@@ -193,6 +195,11 @@ def main():
         print(model)
         print()
 
+    if args.compile:
+        if is_master:
+            print("Compiling model with torch.compile (first step will be slow)...")
+        model = torch.compile(model)
+
     if is_ddp:
         model = DDP(model, device_ids=[local_rank])
 
@@ -247,9 +254,10 @@ def main():
         set_lr(optimizer, muon_lr, adamw_lr)
 
         optimizer.zero_grad(set_to_none=True)
-        loss_accum = 0.0
+        loss_accum = torch.zeros(1, device=device)
         non_blocking = device.type == "cuda"
         last_mask = None
+        skip_step = False
 
         for micro in range(args.grad_accum):
             try:
@@ -277,10 +285,14 @@ def main():
             if not loss.isfinite():
                 print(f"  [warn] step {step} micro {micro}: non-finite loss, skipping step")
                 optimizer.zero_grad(set_to_none=True)
+                skip_step = True
                 break
 
             loss.backward()
-            loss_accum += loss.item()
+            loss_accum += loss.detach()
+
+        if skip_step:
+            continue
 
         nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
@@ -293,7 +305,7 @@ def main():
             active = int(last_mask.sum().item()) if (last_mask is not None and last_mask.isfinite().all()) else -1
             print(
                 f"step {step:6d}/{args.max_steps} | "
-                f"loss {loss_accum:.4f} | "
+                f"loss {loss_accum.item():.4f} | "
                 f"lr {muon_lr:.2e} | "
                 f"active_tok {active} | "
                 f"{tok_per_s:,.0f} tok/s"
