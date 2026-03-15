@@ -233,12 +233,17 @@ def get_sft_dataloader(
         )
         shuffle = False
 
+    pin_memory  = torch.cuda.is_available()
+    num_workers = 0 if (dataset_type == "synthetic" or not torch.cuda.is_available()) else 4
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
         sampler=sampler,
         shuffle=shuffle if sampler is None else False,
-        pin_memory=torch.cuda.is_available(),
-        num_workers=0,
+        pin_memory=pin_memory,
+        num_workers=num_workers,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=2 if num_workers > 0 else None,
         drop_last=True,
     )

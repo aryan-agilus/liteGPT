@@ -115,6 +115,9 @@ def main():
     parser.add_argument("--grad_ckpt",  action="store_true",
                         help="Enable gradient checkpointing (~8x less activation memory, "
                              "~33% more compute). Recommended for depth>=12 on single GPU.")
+    parser.add_argument("--compile",    action="store_true",
+                        help="torch.compile the model for ~20-30%% extra throughput "
+                             "(first step is slow due to compilation).")
 
     # Device / precision
     parser.add_argument("--device",     type=str,   default=None,
@@ -167,7 +170,7 @@ def main():
         print(f"  device={device}  dtype={dtype}  world_size={world_size}")
         print(f"  depth={args.depth}  seq_len={args.seq_len}  batch={args.batch_size}")
         print(f"  grad_accum={args.grad_accum}  eff_batch={eff_batch}  grad_ckpt={args.grad_ckpt}")
-        print(f"  max_steps={args.max_steps}  dataset={args.dataset}")
+        print(f"  compile={args.compile}  max_steps={args.max_steps}  dataset={args.dataset}")
         print(f"{'='*60}\n")
 
     # ------------------------------------------------------------------
@@ -193,10 +196,19 @@ def main():
         if is_master:
             print(f"Resumed from {args.resume} at step {start_step}")
 
+    # torch.compile — fuses kernels, removes Python overhead, ~20-30% faster.
+    # Must happen before DDP so DDP wraps the compiled model.
+    if args.compile:
+        if is_master:
+            print("Compiling model with torch.compile (first step will be slow)...")
+        model = torch.compile(model)
+
     if is_ddp:
         model = DDP(model, device_ids=[local_rank])
 
     raw_model = model.module if is_ddp else model
+    if args.compile and not is_ddp:
+        raw_model = model  # compiled but not DDP-wrapped
 
     # ------------------------------------------------------------------
     # Optimizer
@@ -251,7 +263,9 @@ def main():
         # optimizer update. For DDP, suppress the all-reduce on every
         # micro-step except the last (no_sync saves ~2x communication).
         optimizer.zero_grad(set_to_none=True)
-        loss_accum = 0.0
+        # Accumulate loss as a CUDA tensor — avoids GPU→CPU sync on every micro-step.
+        # We only call .item() once at log time, which is a single sync per log_every steps.
+        loss_accum = torch.zeros(1, device=device)
 
         for micro in range(args.grad_accum):
             try:
@@ -273,10 +287,10 @@ def main():
 
             with sync_ctx, autocast_ctx:
                 _, loss = model(x, y)
-                loss = loss / args.grad_accum   # scale so grad magnitude stays constant
+                loss = loss / args.grad_accum
 
             loss.backward()
-            loss_accum += loss.item()
+            loss_accum += loss.detach()
 
         nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
@@ -289,7 +303,7 @@ def main():
             tok_per_s = tokens_since_log / elapsed
             print(
                 f"step {step:6d}/{args.max_steps} | "
-                f"loss {loss_accum:.4f} | "
+                f"loss {loss_accum.item():.4f} | "
                 f"lr {muon_lr:.2e} | "
                 f"{tok_per_s:,.0f} tok/s"
             )

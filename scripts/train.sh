@@ -37,6 +37,7 @@ RESUME="${RESUME:-}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"
 GRAD_CKPT="${GRAD_CKPT:-true}"   # set to "" to disable
+COMPILE="${COMPILE:-true}"       # torch.compile for ~25% speedup; set to "" to disable
 
 eff_batch=$((BATCH_SIZE * GRAD_ACCUM * NPROC))
 
@@ -58,6 +59,7 @@ echo "============================================================"
 EXTRA_ARGS=""
 [[ -n "$RESUME"    ]] && EXTRA_ARGS="$EXTRA_ARGS --resume $RESUME"
 [[ -n "$GRAD_CKPT" ]] && EXTRA_ARGS="$EXTRA_ARGS --grad_ckpt"
+[[ -n "$COMPILE"   ]] && EXTRA_ARGS="$EXTRA_ARGS --compile"
 
 DATA_ARG=""
 [[ "$DATASET" == "text" ]] && DATA_ARG="--data_path $DATA_PATH"
