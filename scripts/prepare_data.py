@@ -53,55 +53,73 @@ def write_uint8_bin(path: str, mask: list[int]):
 # Pretrain tokenization
 # ---------------------------------------------------------------------------
 
+CHUNK_SIZE = 500_000   # flush to disk every 500 K tokens (~1 MB)
+
+
+def _flush(f, buf: list[int]) -> None:
+    """Write buf to an already-open binary file and clear it."""
+    np.array(buf, dtype=np.uint16).tofile(f)
+    buf.clear()
+
+
 def prepare_pretrain(args):
     require("datasets")
     from datasets import load_dataset
     from litegpt.tokenizer import Tokenizer
 
     tok = Tokenizer()
-    all_tokens: list[int] = []
+
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+
+    total_tokens = 0
+    buf: list[int] = []
+
+    def process(ds, label: str):
+        nonlocal total_tokens
+        with open(args.out, "wb") as f:
+            for i, ex in enumerate(ds):
+                if args.max_examples and i >= args.max_examples:
+                    break
+                text = ex.get("text", ex.get("content", "")).strip()
+                if not text:
+                    continue
+                buf.append(tok.bos_id)
+                buf.extend(tok.encode(text))
+                if len(buf) >= CHUNK_SIZE:
+                    total_tokens += len(buf)
+                    _flush(f, buf)
+                if (i + 1) % 10_000 == 0:
+                    print(f"  {i+1:,} {label} | {total_tokens + len(buf):,} tokens written")
+            if buf:
+                total_tokens += len(buf)
+                _flush(f, buf)
 
     if args.dataset == "tinystories":
         print("Downloading roneneldan/TinyStories …")
         ds = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
-        for i, ex in enumerate(ds):
-            if args.max_examples and i >= args.max_examples:
-                break
-            text = ex["text"].strip()
-            if text:
-                all_tokens.append(tok.bos_id)
-                all_tokens.extend(tok.encode(text))
-            if (i + 1) % 10_000 == 0:
-                print(f"  {i+1:,} stories | {len(all_tokens):,} tokens")
+        process(ds, "stories")
 
     elif args.dataset == "text":
         if not args.text_file:
             print("[error] --text_file required for --dataset text")
             sys.exit(1)
         print(f"Tokenizing {args.text_file} …")
-        with open(args.text_file, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    all_tokens.append(tok.bos_id)
-                    all_tokens.extend(tok.encode(line))
+        def _file_iter():
+            with open(args.text_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        yield {"text": line}
+        process(_file_iter(), "lines")
 
     else:
         # Treat as HuggingFace dataset slug; assumes it has a "text" column
         print(f"Downloading {args.dataset} …")
         ds = load_dataset(args.dataset, split="train", streaming=True)
-        for i, ex in enumerate(ds):
-            if args.max_examples and i >= args.max_examples:
-                break
-            text = ex.get("text", ex.get("content", "")).strip()
-            if text:
-                all_tokens.append(tok.bos_id)
-                all_tokens.extend(tok.encode(text))
-            if (i + 1) % 10_000 == 0:
-                print(f"  {i+1:,} docs | {len(all_tokens):,} tokens")
+        process(ds, "docs")
 
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    write_uint16_bin(args.out, all_tokens)
+    mb = total_tokens * 2 / 1e6
+    print(f"  wrote {total_tokens:,} tokens  ({mb:.1f} MB) → {args.out}")
 
 
 # ---------------------------------------------------------------------------
