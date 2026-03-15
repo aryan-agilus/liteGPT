@@ -107,6 +107,10 @@ def main():
                         help="Muon LR — lower than pretrain since weights are already good")
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--grad_clip",    type=float, default=1.0)
+    parser.add_argument("--grad_accum",   type=int,   default=1,
+                        help="Gradient accumulation steps.")
+    parser.add_argument("--grad_ckpt",    action="store_true",
+                        help="Enable gradient checkpointing.")
     parser.add_argument("--log_every",    type=int,   default=10)
 
     # Device
@@ -144,11 +148,14 @@ def main():
         else contextlib.nullcontext()
     )
 
+    eff_batch = args.batch_size * args.grad_accum * world_size
+
     if is_master:
         print(f"\n{'='*60}")
         print(f"  SFT fine-tuning")
         print(f"  device={device}  dtype={dtype}  world_size={world_size}")
         print(f"  dataset={args.dataset}  seq_len={args.seq_len}  batch={args.batch_size}")
+        print(f"  grad_accum={args.grad_accum}  eff_batch={eff_batch}  grad_ckpt={args.grad_ckpt}")
         print(f"{'='*60}\n")
 
     # ------------------------------------------------------------------
@@ -163,12 +170,14 @@ def main():
         base = torch.load(args.base_checkpoint, map_location=device, weights_only=False)
         config = base["config"]
         model  = GPT(config).to(device).to(dtype)
+        model.gradient_checkpointing = args.grad_ckpt
         model.load_state_dict(base["model"])
         model.setup_rope()
     else:
         # No base checkpoint — train SFT from a random init (useful for smoke tests)
         config = GPTConfig(depth=args.depth, seq_len=args.seq_len)
         model  = GPT(config).to(device).to(dtype)
+        model.gradient_checkpointing = args.grad_ckpt
         model.setup_rope()
 
     resume_ckpt: dict | None = None
@@ -237,42 +246,54 @@ def main():
         adamw_lr = muon_lr * (config.model_dim / 768) ** -0.5
         set_lr(optimizer, muon_lr, adamw_lr)
 
-        try:
-            x, y, mask = next(data_iter)
-        except StopIteration:
-            data_iter = iter(loader)
-            x, y, mask = next(data_iter)
-
-        # non_blocking only helps with pinned CPU→CUDA copies; skip for MPS/CPU
-        non_blocking = device.type == "cuda"
-        x    = x.to(device, non_blocking=non_blocking)
-        y    = y.to(device, non_blocking=non_blocking)
-        mask = mask.to(device, non_blocking=non_blocking)
-
-        with autocast_ctx:
-            logits, _ = model(x)                       # don't use built-in loss
-            loss = masked_cross_entropy(logits, y, mask)
-
-        if not loss.isfinite():
-            print(f"  [warn] step {step}: non-finite loss {loss.item():.4f}, skipping")
-            optimizer.zero_grad(set_to_none=True)
-            continue
-
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        loss_accum = 0.0
+        non_blocking = device.type == "cuda"
+        last_mask = None
+
+        for micro in range(args.grad_accum):
+            try:
+                x, y, mask = next(data_iter)
+            except StopIteration:
+                data_iter = iter(loader)
+                x, y, mask = next(data_iter)
+
+            x    = x.to(device, non_blocking=non_blocking)
+            y    = y.to(device, non_blocking=non_blocking)
+            mask = mask.to(device, non_blocking=non_blocking)
+            last_mask = mask
+
+            is_last_micro = micro == args.grad_accum - 1
+            sync_ctx = (
+                contextlib.nullcontext()
+                if (not is_ddp or is_last_micro)
+                else model.no_sync()
+            )
+
+            with sync_ctx, autocast_ctx:
+                logits, _ = model(x)
+                loss = masked_cross_entropy(logits, y, mask) / args.grad_accum
+
+            if not loss.isfinite():
+                print(f"  [warn] step {step} micro {micro}: non-finite loss, skipping step")
+                optimizer.zero_grad(set_to_none=True)
+                break
+
+            loss.backward()
+            loss_accum += loss.item()
+
         nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
 
-        tokens_since_log += args.batch_size * args.seq_len * world_size
+        tokens_since_log += args.batch_size * args.grad_accum * args.seq_len * world_size
 
         if is_master and step % args.log_every == 0:
             elapsed = time.perf_counter() - t0
             tok_per_s = tokens_since_log / elapsed
-            # Count active (assistant) tokens in this batch for transparency
-            active = int(mask.sum().item()) if mask.isfinite().all() else -1
+            active = int(last_mask.sum().item()) if (last_mask is not None and last_mask.isfinite().all()) else -1
             print(
                 f"step {step:6d}/{args.max_steps} | "
-                f"loss {loss.item():.4f} | "
+                f"loss {loss_accum:.4f} | "
                 f"lr {muon_lr:.2e} | "
                 f"active_tok {active} | "
                 f"{tok_per_s:,.0f} tok/s"
